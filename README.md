@@ -68,6 +68,43 @@ Sometimes you don't care about checking HTTP if HTTPS is working. You can do tha
 ▶ cat domains.txt | httprobe --prefer-https
 ```
 
+## SARIF Output
+
+To feed probe results into a security dashboard that consumes
+[SARIF 2.1.0](https://docs.oasis-open.org/sarif/sarif/v2.1.0/sarif-v2.1.0.html),
+enable SARIF output with the `-sarif` flag. Every listening service is written as
+an independent result with a stable `ruleId`, a severity level, a message and the
+precise location (line and columns) of the input entry that produced it. The
+standard line-by-line stdout output is unchanged.
+
+```
+▶ cat domains.txt | httprobe -sarif results.sarif
+```
+
+By default results point at the `stdin` artifact. Pass `-input` to read domains
+from a file instead; artifact locations are then stored repository-relative
+(with a `%SRCROOT%` base id) so no absolute or temporary paths leak into the
+report:
+
+```
+▶ httprobe -input recon/domains.txt -sarif results.sarif
+```
+
+Rules and levels are fixed across runs and versions:
+
+| Rule ID | Meaning | Level |
+| --- | --- | --- |
+| `HTTPS-001` | HTTPS service listening on the default port (443) | `note` |
+| `HTTP-001` | HTTP service listening on the default port (80) | `warning` |
+| `PORT-001` | Service listening on a non-standard port | `error` |
+
+The level mapping is defined in code in `sarif.go`; results are streamed and
+flushed in chunks, so scans with tens of thousands of findings do not buffer the
+entire report in memory. The file is written to a temporary path and atomically
+renamed into place only after the document validates, so a failed scan never
+leaves a half-written SARIF file. When the scan fails the report is still valid
+and the single `invocation` is marked `executionSuccessful: false`.
+
 ## Docker
 
 Build the docker container:
@@ -81,4 +118,3 @@ Run the container, passing the contents of a file into stdin of the process insi
 ```
 ▶ cat domains.txt | docker run -i httprobe <args>
 ```
-
