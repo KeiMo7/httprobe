@@ -1,0 +1,44 @@
+{
+  "targets": [
+    "10.10.1.15",
+    "10.20.30.40:8080",
+    {
+      "host": "legacy.intranet.example",
+      "rule": "R1"
+    }
+  ],
+  "proxies": [
+    {
+      "id": "P0",
+      "address": "http://10.0.0.10:3128"
+    },
+    {
+      "id": "P1",
+      "address": "http://10.0.0.11:3128",
+      "username_env": "PROXY_P1_USER",
+      "password_env": "PROXY_P1_PASSWORD"
+    }
+  ],
+  "rules": [
+    {
+      "id": "R0",
+      "cidr": "10.10.0.0/16",
+      "proxy_id": "P0"
+    },
+    {
+      "id": "R2",
+      "cidr": "10.10.1.0/24",
+      "proxy_id": "P1"
+    },
+    {
+      "id": "R1",
+      "cidr": "10.20.0.0/16",
+      "proxy_id": "P1"
+    }
+  ],
+  "timeout_ms": 10000,
+  "connect_timeout_ms": 2000,
+  "read_timeout_ms": 5000,
+  "proxy_failure_threshold": 5,
+  "summary": true
+}

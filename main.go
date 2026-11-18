@@ -2,17 +2,13 @@ package main
 
 import (
 	"bufio"
-	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
-	"net"
-	"net/http"
 	"os"
 	"strings"
 	"sync"
-	"time"
 )
 
 type probeArgs []string
@@ -26,209 +22,255 @@ func (p probeArgs) String() string {
 	return strings.Join(p, ",")
 }
 
+type options struct {
+	concurrency      int
+	probes           probeArgs
+	skipDefault      bool
+	timeoutMS        int
+	preferHTTPS      bool
+	method           string
+	configPath       string
+	proxy            string
+	proxyUserEnv     string
+	proxyPasswordEnv string
+	connectTimeoutMS int
+	readTimeoutMS    int
+	failThreshold    int
+	summary          bool
+	summarySet       bool
+	help             bool
+}
+
+type target struct {
+	host string
+	rule string
+}
+
 func main() {
+	if err := run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr); err != nil {
+		fmt.Fprintf(os.Stderr, "httprobe: %v\n", err)
+		os.Exit(2)
+	}
+}
 
-	// concurrency flag
-	var concurrency int
-	flag.IntVar(&concurrency, "c", 20, "set the concurrency level (split equally between HTTPS and HTTP requests)")
-
-	// probe flags
-	var probes probeArgs
-	flag.Var(&probes, "p", "add additional probe (proto:port)")
-
-	// skip default probes flag
-	var skipDefault bool
-	flag.BoolVar(&skipDefault, "s", false, "skip the default probes (http:80 and https:443)")
-
-	// timeout flag
-	var to int
-	flag.IntVar(&to, "t", 10000, "timeout (milliseconds)")
-
-	// prefer https
-	var preferHTTPS bool
-	flag.BoolVar(&preferHTTPS, "prefer-https", false, "only try plain HTTP if HTTPS fails")
-
-	// HTTP method to use
-	var method string
-	flag.StringVar(&method, "method", "GET", "HTTP method to use")
-
-	flag.Parse()
-
-	// make an actual time.Duration out of the timeout
-	timeout := time.Duration(to * 1000000)
-
-	var tr = &http.Transport{
-		MaxIdleConns:      30,
-		IdleConnTimeout:   time.Second,
-		DisableKeepAlives: true,
-		TLSClientConfig:   &tls.Config{InsecureSkipVerify: true},
-		DialContext: (&net.Dialer{
-			Timeout:   timeout,
-			KeepAlive: time.Second,
-		}).DialContext,
+func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+	opts, err := parseOptions(args, stderr)
+	if err != nil {
+		return err
+	}
+	if opts.help {
+		return nil
 	}
 
-	re := func(req *http.Request, via []*http.Request) error {
-		return http.ErrUseLastResponse
+	plan, err := buildPlan(opts, os.LookupEnv)
+	if err != nil {
+		return err
 	}
 
-	client := &http.Client{
-		Transport:     tr,
-		CheckRedirect: re,
-		Timeout:       timeout,
+	return execute(opts, plan, stdin, stdout, stderr)
+}
+
+func parseOptions(args []string, stderr io.Writer) (options, error) {
+	var opts options
+
+	fs := flag.NewFlagSet("httprobe", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	fs.IntVar(&opts.concurrency, "c", 20, "set the concurrency level (split equally between HTTPS and HTTP requests)")
+	fs.Var(&opts.probes, "p", "add additional probe (proto:port)")
+	fs.BoolVar(&opts.skipDefault, "s", false, "skip the default probes (http:80 and https:443)")
+	fs.IntVar(&opts.timeoutMS, "t", 10000, "timeout (milliseconds)")
+	fs.BoolVar(&opts.preferHTTPS, "prefer-https", false, "only try plain HTTP if HTTPS fails")
+	fs.StringVar(&opts.method, "method", "GET", "HTTP method to use")
+	fs.StringVar(&opts.configPath, "config", "", "JSON configuration file for targets, proxy rules and timeouts")
+	fs.StringVar(&opts.proxy, "proxy", "", "forward every probe through this HTTP proxy")
+	fs.StringVar(&opts.proxyUserEnv, "proxy-user-env", "", "environment variable containing the proxy username")
+	fs.StringVar(&opts.proxyPasswordEnv, "proxy-password-env", "", "environment variable containing the proxy password")
+	fs.IntVar(&opts.connectTimeoutMS, "connect-timeout", 0, "proxy/target connection timeout in milliseconds")
+	fs.IntVar(&opts.readTimeoutMS, "read-timeout", 0, "response read timeout in milliseconds")
+	fs.IntVar(&opts.failThreshold, "proxy-fail-threshold", 0, "consecutive proxy failures before opening its circuit")
+	fs.BoolVar(&opts.summary, "summary", false, "print per-rule result summary to stderr")
+
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			opts.help = true
+			return opts, nil
+		}
+		return opts, err
+	}
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "summary" {
+			opts.summarySet = true
+		}
+	})
+	if opts.concurrency < 2 {
+		return opts, fmt.Errorf("-c must be at least 2")
+	}
+	if opts.timeoutMS < 0 || opts.connectTimeoutMS < 0 || opts.readTimeoutMS < 0 || opts.failThreshold < 0 {
+		return opts, fmt.Errorf("timeouts and -proxy-fail-threshold must not be negative")
+	}
+	if opts.configPath != "" && opts.proxy != "" {
+		return opts, fmt.Errorf("-config and -proxy cannot be used together")
+	}
+	if opts.proxy == "" && (opts.proxyUserEnv != "" || opts.proxyPasswordEnv != "") {
+		return opts, fmt.Errorf("-proxy-user-env and -proxy-password-env require -proxy")
 	}
 
-	// domain/port pairs are initially sent on the httpsURLs channel.
-	// If they are listening and the --prefer-https flag is set then
-	// no HTTP check is performed; otherwise they're put onto the httpURLs
-	// channel for an HTTP check.
-	httpsURLs := make(chan string)
-	httpURLs := make(chan string)
-	output := make(chan string)
+	return opts, nil
+}
 
-	// HTTPS workers
+type event struct {
+	stdout string
+	stderr string
+}
+
+func execute(opts options, plan *runtimePlan, stdin io.Reader, stdout, stderr io.Writer) error {
+	httpsURLs := make(chan target)
+	httpURLs := make(chan target)
+	events := make(chan event)
+
 	var httpsWG sync.WaitGroup
-	for i := 0; i < concurrency/2; i++ {
+	for i := 0; i < opts.concurrency/2; i++ {
 		httpsWG.Add(1)
-
 		go func() {
-			for url := range httpsURLs {
+			for tgt := range httpsURLs {
+				route := plan.router.routeFor(tgt.host, tgt.rule)
+				withProto := "https://" + tgt.host
+				result := probeURL(route, withProto, opts.method)
+				plan.stats.record(route, result)
 
-				// always try HTTPS first
-				withProto := "https://" + url
-				if isListening(client, withProto, method) {
-					output <- withProto
-
-					// skip trying HTTP if --prefer-https is set
-					if preferHTTPS {
+				if result.ok {
+					events <- event{stdout: formatSuccess(withProto, route, plan.proxyMode)}
+					if opts.preferHTTPS {
 						continue
 					}
+				} else if plan.proxyMode {
+					events <- event{stderr: formatFailure(withProto, route, result)}
 				}
 
-				httpURLs <- url
+				httpURLs <- tgt
 			}
-
 			httpsWG.Done()
 		}()
 	}
 
-	// HTTP workers
 	var httpWG sync.WaitGroup
-	for i := 0; i < concurrency/2; i++ {
+	for i := 0; i < opts.concurrency/2; i++ {
 		httpWG.Add(1)
-
 		go func() {
-			for url := range httpURLs {
-				withProto := "http://" + url
-				if isListening(client, withProto, method) {
-					output <- withProto
-					continue
+			for tgt := range httpURLs {
+				route := plan.router.routeFor(tgt.host, tgt.rule)
+				withProto := "http://" + tgt.host
+				result := probeURL(route, withProto, opts.method)
+				plan.stats.record(route, result)
+
+				if result.ok {
+					events <- event{stdout: formatSuccess(withProto, route, plan.proxyMode)}
+				} else if plan.proxyMode {
+					events <- event{stderr: formatFailure(withProto, route, result)}
 				}
 			}
-
 			httpWG.Done()
 		}()
 	}
 
-	// Close the httpURLs channel when the HTTPS workers are done
 	go func() {
 		httpsWG.Wait()
 		close(httpURLs)
 	}()
 
-	// Output worker
-	var outputWG sync.WaitGroup
-	outputWG.Add(1)
+	var eventWG sync.WaitGroup
+	eventWG.Add(1)
 	go func() {
-		for o := range output {
-			fmt.Println(o)
+		for evt := range events {
+			if evt.stdout != "" {
+				fmt.Fprintln(stdout, evt.stdout)
+			}
+			if evt.stderr != "" {
+				fmt.Fprint(stderr, evt.stderr)
+			}
 		}
-		outputWG.Done()
+		eventWG.Done()
 	}()
 
-	// Close the output channel when the HTTP workers are done
 	go func() {
 		httpWG.Wait()
-		close(output)
+		close(events)
 	}()
 
-	// accept domains on stdin
-	sc := bufio.NewScanner(os.Stdin)
-	for sc.Scan() {
-		domain := strings.ToLower(sc.Text())
+	submitTargets(opts, plan.targets, stdin, httpsURLs, httpURLs, stderr)
+	close(httpsURLs)
+	eventWG.Wait()
 
-		// submit standard port checks
-		if !skipDefault {
-			httpsURLs <- domain
+	if plan.summary {
+		plan.stats.print(stderr)
+	}
+
+	return nil
+}
+
+func submitTargets(opts options, configTargets []target, stdin io.Reader, httpsURLs, httpURLs chan<- target, stderr io.Writer) {
+	xlarge := []string{"81", "300", "591", "593", "832", "981", "1010", "1311", "2082", "2087", "2095", "2096", "2480", "3000", "3128", "3333", "4243", "4567", "4711", "4712", "4993", "5000", "5104", "5108", "5800", "6543", "7000", "7396", "7474", "8000", "8001", "8008", "8014", "8042", "8069", "8080", "8081", "8088", "8090", "8091", "8118", "8123", "8172", "8222", "8243", "8280", "8281", "8333", "8443", "8500", "8834", "8880", "8888", "8983", "9000", "9043", "9060", "9080", "9090", "9091", "9200", "9443", "9800", "9981", "12443", "16080", "18091", "18092", "20720", "28017"}
+	large := []string{"81", "591", "2082", "2087", "2095", "2096", "3000", "8000", "8001", "8008", "8080", "8083", "8443", "8834", "8888"}
+
+	submit := func(tgt target) {
+		if !opts.skipDefault {
+			httpsURLs <- tgt
 		}
 
-		// Adding port templates
-		xlarge := []string{"81", "300", "591", "593", "832", "981", "1010", "1311", "2082", "2087", "2095", "2096", "2480", "3000", "3128", "3333", "4243", "4567", "4711", "4712", "4993", "5000", "5104", "5108", "5800", "6543", "7000", "7396", "7474", "8000", "8001", "8008", "8014", "8042", "8069", "8080", "8081", "8088", "8090", "8091", "8118", "8123", "8172", "8222", "8243", "8280", "8281", "8333", "8443", "8500", "8834", "8880", "8888", "8983", "9000", "9043", "9060", "9080", "9090", "9091", "9200", "9443", "9800", "9981", "12443", "16080", "18091", "18092", "20720", "28017"}
-		large := []string{"81", "591", "2082", "2087", "2095", "2096", "3000", "8000", "8001", "8008", "8080", "8083", "8443", "8834", "8888"}
-
-		// submit any additional proto:port probes
-		for _, p := range probes {
-			switch p {
+		for _, probe := range opts.probes {
+			switch probe {
 			case "xlarge":
 				for _, port := range xlarge {
-					httpsURLs <- fmt.Sprintf("%s:%s", domain, port)
+					httpsURLs <- target{host: tgt.host + ":" + port, rule: tgt.rule}
 				}
 			case "large":
 				for _, port := range large {
-					httpsURLs <- fmt.Sprintf("%s:%s", domain, port)
+					httpsURLs <- target{host: tgt.host + ":" + port, rule: tgt.rule}
 				}
 			default:
-				pair := strings.SplitN(p, ":", 2)
+				pair := strings.SplitN(probe, ":", 2)
 				if len(pair) != 2 {
 					continue
 				}
 
-				// This is a little bit funny as "https" will imply an
-				// http check as well unless the --prefer-https flag is
-				// set. On balance I don't think that's *such* a bad thing
-				// but it is maybe a little unexpected.
-				if strings.ToLower(pair[0]) == "https" {
-					httpsURLs <- fmt.Sprintf("%s:%s", domain, pair[1])
+				probeTarget := target{host: tgt.host + ":" + pair[1], rule: tgt.rule}
+				if strings.EqualFold(pair[0], "https") {
+					httpsURLs <- probeTarget
 				} else {
-					httpURLs <- fmt.Sprintf("%s:%s", domain, pair[1])
+					httpURLs <- probeTarget
 				}
 			}
 		}
 	}
 
-	// once we've sent all the URLs off we can close the
-	// input/httpsURLs channel. The workers will finish what they're
-	// doing and then call 'Done' on the WaitGroup
-	close(httpsURLs)
-
-	// check there were no errors reading stdin (unlikely)
-	if err := sc.Err(); err != nil {
-		fmt.Fprintf(os.Stderr, "failed to read input: %s\n", err)
+	for _, tgt := range configTargets {
+		submit(tgt)
 	}
 
-	// Wait until the output waitgroup is done
-	outputWG.Wait()
+	if shouldReadStdin(opts, len(configTargets), stdin) {
+		sc := bufio.NewScanner(stdin)
+		for sc.Scan() {
+			submit(target{host: strings.ToLower(sc.Text())})
+		}
+		if err := sc.Err(); err != nil {
+			fmt.Fprintf(stderr, "failed to read input: %s\n", err)
+		}
+	}
 }
 
-func isListening(client *http.Client, url, method string) bool {
+func shouldReadStdin(opts options, configTargetCount int, stdin io.Reader) bool {
+	if opts.configPath == "" || configTargetCount == 0 {
+		return true
+	}
 
-	req, err := http.NewRequest(method, url, nil)
+	file, ok := stdin.(*os.File)
+	if !ok {
+		return true
+	}
+
+	info, err := file.Stat()
 	if err != nil {
-		return false
+		return true
 	}
-
-	req.Header.Add("Connection", "close")
-	req.Close = true
-
-	resp, err := client.Do(req)
-	if resp != nil {
-		io.Copy(ioutil.Discard, resp.Body)
-		resp.Body.Close()
-	}
-
-	if err != nil {
-		return false
-	}
-
-	return true
+	return info.Mode()&os.ModeCharDevice == 0
 }

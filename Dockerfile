@@ -1,14 +1,13 @@
-FROM golang:1.11.4-alpine3.7 AS build-env
-RUN apk add --no-cache --upgrade git openssh-client ca-certificates
-RUN go get -u github.com/golang/dep/cmd/dep
+FROM golang:1.22-alpine AS build-env
+RUN apk add --no-cache --upgrade ca-certificates
 WORKDIR /go/src/app
 
 COPY . /go/src/app
 
-RUN go build -o httprobe main.go
+RUN go build -o httprobe .
 
 
-FROM alpine:3.9
+FROM alpine:3.19
 
 RUN apk add shadow bash && \
     useradd --create-home --shell /sbin/nologin httprobe && \
