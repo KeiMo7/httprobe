@@ -68,6 +68,46 @@ Sometimes you don't care about checking HTTP if HTTPS is working. You can do tha
 ▶ cat domains.txt | httprobe --prefer-https
 ```
 
+## Stable batches
+
+`httprobe` is designed to be run over the same target list repeatedly and to
+produce the same result set every time:
+
+* Every scheduled target reaches a terminal state (`reachable`, `refused`,
+  `timeout`, `error`, `canceled`, `skipped`). A target is never silently
+  dropped, even when the concurrency limit is much smaller than the batch.
+* Results are emitted in a deterministic order derived from the input order,
+  so two runs can be diffed directly.
+* Duplicate `host:port` probes within one run are merged, so a target is never
+  probed twice.
+* Timeouts and refusals are classified from the concrete connection error
+  (deadline / `ECONNREFUSED`), not from elapsed time.
+
+Additional optional flags:
+
+```
+-p             add probes as before
+-t             timeout in milliseconds
+-c             concurrency (always at least one worker)
+-attempts N    try each target up to N times (default 1)
+-prefer-https  skip HTTP when HTTPS already works
+--json         emit {url,status,attempts,last_error} per target instead of bare URLs
+-o FILE        write results to FILE atomically; completed results survive Ctrl-C
+-progress      print batch progress to stderr
+-i FILE        read domains from FILE instead of stdin
+```
+
+`-json` reports the attempt count and the final error class for every target,
+for example:
+
+```
+{"url":"http://example.com","status":"reachable","attempts":1,"last_error":"none","reachable":true}
+{"url":"http://example.com:8080","status":"refused","attempts":1,"last_error":"connection_refused","reachable":false}
+```
+
+Bare-URL stdout stays the default; only reachable URLs are printed, exactly as
+before. Progress and diagnostics go to stderr.
+
 ## Docker
 
 Build the docker container:
