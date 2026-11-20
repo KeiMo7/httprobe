@@ -52,6 +52,10 @@ func main() {
 	var method string
 	flag.StringVar(&method, "method", "GET", "HTTP method to use")
 
+	// trace file for mapping probe targets back to raw input lines
+	var tracePath string
+	flag.StringVar(&tracePath, "trace", "", "write target-to-input trace information to a file (JSON Lines); '-' writes to stderr")
+
 	flag.Parse()
 
 	// make an actual time.Duration out of the timeout
@@ -152,30 +156,67 @@ func main() {
 		close(output)
 	}()
 
-	// accept domains on stdin
+	// accept domains on stdin, normalizing and de-duplicating them before
+	// probing so each canonical target is probed at most once
 	sc := bufio.NewScanner(os.Stdin)
+	sc.Buffer(make([]byte, 64*1024), 1024*1024)
+	acc := NewAccumulator()
+	lineNo := 0
 	for sc.Scan() {
-		domain := strings.ToLower(sc.Text())
+		lineNo++
+		acc.Add(NormalizeLine(lineNo, sc.Text()))
+	}
+
+	// check there were no errors reading stdin (unlikely); a read failure
+	// still lets us probe everything that was read so far
+	if err := sc.Err(); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to read input: %s\n", err)
+	}
+
+	// Emit trace information separately from stdout. A broken trace channel
+	// must never interrupt the batch: log and carry on without it.
+	if tracePath != "" {
+		traceFile, err := openTrace(tracePath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: cannot open trace output %q: %s; continuing without trace\n", tracePath, err)
+		} else {
+			if err := acc.WriteTrace(traceFile); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: failed to write trace: %s\n", err)
+			}
+			if traceFile != os.Stderr {
+				traceFile.Close()
+			}
+		}
+	}
+
+	// Report skipped/unparseable entries on stderr only; stdout keeps its
+	// one-probe-result-per-line contract.
+	if n := len(acc.Invalid); n > 0 {
+		fmt.Fprintf(os.Stderr, "skipped %d unparseable entr%s\n", n, plural(n, "y", "ies"))
+	}
+
+	// Adding port templates
+	xlarge := []string{"81", "300", "591", "593", "832", "981", "1010", "1311", "2082", "2087", "2095", "2096", "2480", "3000", "3128", "3333", "4243", "4567", "4711", "4712", "4993", "5000", "5104", "5108", "5800", "6543", "7000", "7396", "7474", "8000", "8001", "8008", "8014", "8042", "8069", "8080", "8081", "8088", "8090", "8091", "8118", "8123", "8172", "8222", "8243", "8280", "8281", "8333", "8443", "8500", "8834", "8880", "8888", "8983", "9000", "9043", "9060", "9080", "9090", "9091", "9200", "9443", "9800", "9981", "12443", "16080", "18091", "18092", "20720", "28017"}
+	large := []string{"81", "591", "2082", "2087", "2095", "2096", "3000", "8000", "8001", "8008", "8080", "8083", "8443", "8834", "8888"}
+
+	for _, t := range acc.Targets() {
+		domain := t.Target
 
 		// submit standard port checks
 		if !skipDefault {
 			httpsURLs <- domain
 		}
 
-		// Adding port templates
-		xlarge := []string{"81", "300", "591", "593", "832", "981", "1010", "1311", "2082", "2087", "2095", "2096", "2480", "3000", "3128", "3333", "4243", "4567", "4711", "4712", "4993", "5000", "5104", "5108", "5800", "6543", "7000", "7396", "7474", "8000", "8001", "8008", "8014", "8042", "8069", "8080", "8081", "8088", "8090", "8091", "8118", "8123", "8172", "8222", "8243", "8280", "8281", "8333", "8443", "8500", "8834", "8880", "8888", "8983", "9000", "9043", "9060", "9080", "9090", "9091", "9200", "9443", "9800", "9981", "12443", "16080", "18091", "18092", "20720", "28017"}
-		large := []string{"81", "591", "2082", "2087", "2095", "2096", "3000", "8000", "8001", "8008", "8080", "8083", "8443", "8834", "8888"}
-
 		// submit any additional proto:port probes
 		for _, p := range probes {
 			switch p {
 			case "xlarge":
 				for _, port := range xlarge {
-					httpsURLs <- fmt.Sprintf("%s:%s", domain, port)
+					httpsURLs <- joinHostPort(t.Host, port)
 				}
 			case "large":
 				for _, port := range large {
-					httpsURLs <- fmt.Sprintf("%s:%s", domain, port)
+					httpsURLs <- joinHostPort(t.Host, port)
 				}
 			default:
 				pair := strings.SplitN(p, ":", 2)
@@ -188,9 +229,9 @@ func main() {
 				// set. On balance I don't think that's *such* a bad thing
 				// but it is maybe a little unexpected.
 				if strings.ToLower(pair[0]) == "https" {
-					httpsURLs <- fmt.Sprintf("%s:%s", domain, pair[1])
+					httpsURLs <- joinHostPort(t.Host, pair[1])
 				} else {
-					httpURLs <- fmt.Sprintf("%s:%s", domain, pair[1])
+					httpURLs <- joinHostPort(t.Host, pair[1])
 				}
 			}
 		}
@@ -200,11 +241,6 @@ func main() {
 	// input/httpsURLs channel. The workers will finish what they're
 	// doing and then call 'Done' on the WaitGroup
 	close(httpsURLs)
-
-	// check there were no errors reading stdin (unlikely)
-	if err := sc.Err(); err != nil {
-		fmt.Fprintf(os.Stderr, "failed to read input: %s\n", err)
-	}
 
 	// Wait until the output waitgroup is done
 	outputWG.Wait()

@@ -68,6 +68,40 @@ Sometimes you don't care about checking HTTP if HTTPS is working. You can do tha
 ▶ cat domains.txt | httprobe --prefer-https
 ```
 
+## Input Normalization And Trace Output
+
+Input lines are normalized before probing, so the same host written in
+different ways is only probed once. Normalization is purely string/encoding
+work — no DNS lookups are performed — and is idempotent:
+
+* `http://` / `https://` prefixes are accepted in any case and stripped from
+  the probe target (the original spelling is kept in the trace).
+* Host names are lower-cased and a trailing dot is removed.
+* Internationalized domain names are converted to punycode (e.g.
+  `bücher.example` → `xn--bcher-kva.example`); the raw line is preserved in
+  the trace. A line that cannot be converted is skipped and reported instead
+  of being silently rewritten.
+* The path, query string and fragment are stripped from the probe target but
+  retained in the trace.
+* IPv6 literals are accepted with or without brackets and canonicalized to
+  the bracketed form (`[2001:db8::1]`, `[2001:db8::1]:8443`) so the host/port
+  boundary is always unambiguous.
+* Surrounding spaces, tabs and carriage returns are trimmed; blank lines are
+  skipped. Lines that cannot be parsed (e.g. `:8080`, `https://`, a bad port)
+  are counted on stderr and skipped without aborting the batch.
+
+Use `-trace` to write the mapping between each probe target and every raw
+input line that produced it as JSON Lines. Trace data never goes to stdout,
+which keeps its one-result-per-line contract:
+
+```
+▶ cat domains.txt | httprobe -trace trace.jsonl
+▶ cat domains.txt | httprobe -trace -   # write the trace to stderr
+```
+
+A failure to open or write the trace file is reported on stderr; probing
+continues without the trace.
+
 ## Docker
 
 Build the docker container:
